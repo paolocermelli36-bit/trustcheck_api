@@ -12,7 +12,15 @@ app = FastAPI(title="MicroboLabs TrustCheck API")
 # CORS: permettiamo richieste dal frontend Flutter web (localhost)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*", "http://localhost", "http://127.0.0.1"],
+    allow_origins = [
+    "*",
+    "http://localhost",
+    "http://127.0.0.1",
+    "https://trustcheck-api.onrender.com",
+    "https://trustcheck-api.onrender.com/",
+    "trustcheck-api.onrender.com"
+]
+],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
