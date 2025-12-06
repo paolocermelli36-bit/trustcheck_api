@@ -95,7 +95,7 @@ def _google_search(query: str, max_results: int = 100) -> List[Dict[str, str]]:
     return results
 
 
-# ========= FILTRO NOME + COGNOME (con word boundary) =========
+# ========= NORMALIZZAZIONE NOME =========
 
 def _normalize_name(query: str):
     tokens = [t.strip().lower() for t in query.split() if t.strip()]
@@ -110,52 +110,42 @@ def _normalize_name(query: str):
         return "", "", ""
 
 
-def _contains_word(text: str, word: str) -> bool:
+def _clean_for_match(text: str) -> str:
     """
-    Match su parola intera: 'oretta' NON matcha 'loretta'.
+    Porta a lower case e sostituisce - e _ con spazio (per le URL).
     """
-    if not word:
-        return False
-    pattern = r"\b" + re.escape(word) + r"\b"
-    return re.search(pattern, text) is not None
+    text = text.lower()
+    text = text.replace("-", " ").replace("_", " ")
+    return text
 
 
-def _word_index(text: str, word: str) -> int:
-    pattern = r"\b" + re.escape(word) + r"\b"
-    m = re.search(pattern, text)
-    return m.start() if m else -1
-
-
-def _matches_name(query: str, text: str) -> bool:
+def _matches_name(query: str, title: str, snippet: str, url: str) -> bool:
     """
-    Tiene il risultato SOLO se:
-    - contiene il nome completo "nome cognome", oppure
-    - contiene sia nome che cognome entro distanza ragionevole.
+    FILTRO SUPER STRETTO:
+    - per query con nome + cognome, accettiamo SOLO se
+      il pattern appare esattamente (contiguo) nel testo o nell'URL.
     """
     first, last, full = _normalize_name(query)
+
+    # Query strana/vuota → non filtriamo
     if not full:
-        return True  # query vuota/strana → non filtriamo
-
-    text = text.lower()
-
-    # match diretto "nome cognome"
-    if _contains_word(text, full):
         return True
 
-    # match "first" + "last" come parole intere
-    if first and last and _contains_word(text, first) and _contains_word(text, last):
-        idx_first = _word_index(text, first)
-        idx_last = _word_index(text, last)
+    # Costruiamo le varianti accettate
+    patterns = [
+        full,                      # "oretta croce"
+        f"{last} {first}",         # "croce oretta"
+        f"{last}, {first}",        # "croce, oretta"
+    ]
 
-        if idx_first != -1 and idx_last != -1:
-            words_before_first = text[:idx_first].count(" ")
-            words_before_last = text[:idx_last].count(" ")
-            word_distance = abs(words_before_last - words_before_first)
+    text_blob = _clean_for_match(f"{title} {snippet}")
+    url_blob = _clean_for_match(url)
 
-            # entro 8 parole → consideriamo rilevante
-            if word_distance <= 8:
-                return True
+    for p in patterns:
+        if p in text_blob or p in url_blob:
+            return True
 
+    # Se non troviamo la sequenza esatta, SCARTIAMO
     return False
 
 
@@ -163,8 +153,10 @@ def _filter_by_name(query: str, items: List[Dict[str, str]]) -> List[Dict[str, s
     filtered: List[Dict[str, str]] = []
 
     for it in items:
-        blob = f"{it.get('title', '')} {it.get('snippet', '')} {it.get('url', '')}"
-        if _matches_name(query, blob):
+        title = it.get("title", "")
+        snippet = it.get("snippet", "")
+        url = it.get("url", "")
+        if _matches_name(query, title, snippet, url):
             filtered.append(it)
 
     return filtered
@@ -241,6 +233,8 @@ def analyze_reputation(query: str, max_results: int = 100) -> Dict[str, Any]:
             level = "HIGH"
         elif score >= 35:
             level = "MEDIUM"
+            # sotto 35 → LOW
+
         else:
             level = "LOW"
 
