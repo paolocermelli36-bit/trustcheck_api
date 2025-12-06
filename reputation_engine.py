@@ -1,442 +1,259 @@
 from typing import List, Dict, Any
-from search_engine import search_web, pro_multi_search
+import requests
+
+from config import GOOGLE_API_KEY, GOOGLE_SEARCH_ENGINE_ID
+
+# ========= PAROLE E DOMINI NEGATIVI =========
+
+NEGATIVE_KEYWORDS = [
+    "scam", "fraud", "ponzi", "scheme", "arrest", "indicted", "charged",
+    "money laundering", "laundering", "fine", "sanction", "lawsuit",
+    "complaint", "investigation", "bribery", "corruption", "crime",
+    "criminal", "regulator", "class action", "bankruptcy", "liquidation",
+    "suspension", "revocation", "ban", "banned", "warning", "blacklist",
+    "watchlist", "default", "debt collection", "foreclosure",
+]
+
+NEGATIVE_DOMAINS_WEIGHTS: Dict[str, int] = {
+    # Autorità e regolatori (peso alto)
+    "sec.gov": 3,
+    "justice.gov": 3,
+    "ftc.gov": 3,
+    "consob.it": 3,
+    "agcm.it": 3,
+    "ivass.it": 3,
+    "bancaditalia.it": 3,
+    "banque-france.fr": 3,
+    "amf-france.org": 3,
+    "fca.org.uk": 3,
+    "finma.ch": 3,
+    "bafin.de": 3,
+
+    # Altra stampa autorevole (peso medio)
+    "reuters.com": 2,
+    "bloomberg.com": 2,
+    "ft.com": 2,
+    "wsj.com": 2,
+    "nytimes.com": 2,
+    "theguardian.com": 2,
+}
 
 
-def _severity_for_text(text: str) -> int:
+# ========= RICERCA SU GOOGLE CSE =========
+
+def _google_search(query: str, max_results: int = 100) -> List[Dict[str, str]]:
     """
-    Calcola la severity (0,1,2,3) in base alle parole chiave trovate
-    nel titolo/snippet. Testo e parole chiave sono tutte in lower case.
+    Esegue la ricerca su Google Programmable Search Engine
+    e restituisce una lista di dict {title, snippet, url}.
     """
+    results: List[Dict[str, str]] = []
+    start = 1
+    per_page = 10
+
+    while len(results) < max_results:
+        num = min(per_page, max_results - len(results))
+
+        params = {
+            "key": GOOGLE_API_KEY,
+            "cx": GOOGLE_SEARCH_ENGINE_ID,
+            "q": query,
+            "start": start,
+            "num": num,
+        }
+
+        resp = requests.get(
+            "https://www.googleapis.com/customsearch/v1",
+            params=params,
+            timeout=10,
+        )
+
+        if resp.status_code != 200:
+            break
+
+        data = resp.json()
+        items = data.get("items", [])
+
+        for item in items:
+            results.append(
+                {
+                    "title": item.get("title", "") or "",
+                    "snippet": item.get("snippet", "") or "",
+                    "url": item.get("link", "") or "",
+                }
+            )
+
+        if not items:
+            break
+
+        start += len(items)
+
+        # limite di Google: oltre 100 risulta inutile
+        if start > 100:
+            break
+
+    return results
+
+
+# ========= FILTRO NOME + COGNOME =========
+
+def _normalize_name(query: str):
+    """
+    Ritorna (first, last, full) in minuscolo.
+    """
+    tokens = [t.strip().lower() for t in query.split() if t.strip()]
+    if len(tokens) >= 2:
+        first = tokens[0]
+        last = tokens[-1]
+        full = f"{first} {last}"
+        return first, last, full
+    elif len(tokens) == 1:
+        return tokens[0], "", tokens[0]
+    else:
+        return "", "", ""
+
+
+def _matches_name(query: str, text: str) -> bool:
+    """
+    Tiene il risultato SOLO se:
+    - contiene il nome completo "nome cognome", oppure
+    - contiene sia nome che cognome entro una distanza ragionevole.
+    """
+    first, last, full = _normalize_name(query)
+    if not full:
+        # query vuota / strana -> tieni tutto
+        return True
+
     text = text.lower()
-    severity = 0
 
-    # livello 3: reati molto gravi / violenza / terrorismo / abusi pesanti
-    lvl3 = [
-        "omicidio",
-        "assassinio",
-        "murder",
-        "homicide",
-        "tentato omicidio",
-        "attempted murder",
-        "stupro",
-        "rape",
-        "violent rape",
-        "gang rape",
-        "violenza sessuale",
-        "sexual assault",
-        "abuso sessuale",
-        "sexual abuse",
-        "pedofilia",
-        "pedophilia",
-        "paedophilia",
-        "child abuse",
-        "child sexual abuse",
-        "abuso su minori",
-        "molestation",
-        "molestie sessuali",
-        "sexual misconduct",
-        "violenza domestica",
-        "domestic violence",
-        "family violence",
-        "brutal assault",
-        "aggravated assault",
-        "aggressione grave",
-        "rapina a mano armata",
-        "armed robbery",
-        "terrorismo",
-        "terrorism",
-        "terrorist attack",
-        "attentato",
-        "bombing",
-        "mass shooting",
-        "school shooting",
-        "sequestro di persona",
-        "kidnapping",
-        "kidnap",
-        "abduction",
-        "hostage taking",
-        "tortura",
-        "torture",
-        "tortured",
-        "traffico di droga",
-        "drug trafficking",
-        "traffico di armi",
-        "arms trafficking",
-        "human trafficking",
-        "traffico di esseri umani",
-        "criminal gang",
-        "criminal organization",
-        "organized crime",
-        "mafia",
-        "camorra",
-        "ndrangheta",
-        "cartel",
-        "drug cartel",
-        "serial killer",
-        "serial murderer",
-        "massacro",
-        "mass murder",
-        "genocidio",
-        "genocide",
-    ]
-    if any(w in text for w in lvl3):
-        return 3
+    # match diretto "nome cognome"
+    if full in text:
+        return True
 
-    # livello 2: frodi, corruzione, riciclaggio, reati finanziari seri / white collar pesanti
-    lvl2 = [
-        "truffa",
-        "truffatore",
-        "truffatori",
-        "frode",
-        "frodi",
-        "fraud",
-        "frauds",
-        "scam",
-        "scams",
-        "scammer",
-        "scammers",
-        "ponzi",
-        "ponzi scheme",
-        "pyramid scheme",
-        "riciclaggio",
-        "riciclaggio di denaro",
-        "money laundering",
-        "laundered money",
-        "evasione fiscale",
-        "tax evasion",
-        "tax fraud",
-        "frode fiscale",
-        "fiscal fraud",
-        "false accounting",
-        "bilanci falsi",
-        "accounting fraud",
-        "securities fraud",
-        "wire fraud",
-        "bank fraud",
-        "insurance fraud",
-        "credit card fraud",
-        "mortgage fraud",
-        "investment fraud",
-        "appropriazione indebita",
-        "embezzlement",
-        "embezzled",
-        "malversazione",
-        "misappropriation",
-        "self dealing",
-        "self-dealing",
-        "insider trading",
-        "market manipulation",
-        "manipolazione di mercato",
-        "aggiotaggio",
-        "price fixing",
-        "bid rigging",
-        "bancarotta fraudolenta",
-        "bankruptcy fraud",
-        "corruzione",
-        "corruption",
-        "bribery",
-        "kickback",
-        "kickbacks",
-        "tangente",
-        "tangenti",
-        "concussione",
-        "racketeering",
-        "criminal conspiracy",
-        "associazione a delinquere",
-        "associazione mafiosa",
-        "organized crime",
-        "frode assicurativa",
-        "insurance scam",
-        "frode bancaria",
-        "conflict of interest",
-        "conflitto di interessi",
-        "false dichiarazioni",
-        "false statements",
-        "forgery",
-        "documenti falsi",
-        "falsificazione di documenti",
-        "false invoicing",
-        "phishing scam",
-        "investment scheme",
-    ]
-    if any(w in text for w in lvl2):
-        severity = max(severity, 2)
+    # match "first" + "last" sparsi ma vicini
+    if first and last and (first in text and last in text):
+        first_idx = text.find(first)
+        last_idx = text.find(last)
 
-    # livello 1: sanzioni, indagini, controversie, cause civili, default, problemi regolatori, reclami
-    lvl1 = [
-        "sanzione",
-        "sanzioni",
-        "sanction",
-        "sanctions",
-        "administrative sanction",
-        "regulatory sanction",
-        "multa",
-        "multe",
-        "fine ",
-        "fined",
-        "civil penalty",
-        "administrative penalty",
-        "enforcement action",
-        "enforcement proceeding",
-        "azioni di enforcement",
-        "provvedimento disciplinare",
-        "disciplinary action",
-        "disciplinary measures",
-        "indagine",
-        "indagini",
-        "investigation",
-        "investigations",
-        "inquiry",
-        "inquiries",
-        "probe",
-        "regulatory probe",
-        "avviso di garanzia",
-        "proceedings",
-        "disciplinary proceedings",
-        "regulatory proceedings",
-        "controversia",
-        "controversie",
-        "controversy",
-        "controversial",
-        "scandalo",
-        "scandali",
-        "scandal",
-        "scandal-hit",
-        "allegations",
-        "allegation",
-        "accuse",
-        "accusations",
-        "accusato",
-        "accused",
-        "charged with",
-        "criminal charge",
-        "criminal charges",
-        "indicted",
-        "indictment",
-        "condanna",
-        "condannato",
-        "convicted",
-        "conviction",
-        "sentenced",
-        "sentencing",
-        "class action",
-        "class-action",
-        "lawsuit",
-        "lawsuits",
-        "cause legale",
-        "cause legali",
-        "legal action",
-        "legal dispute",
-        "legal battle",
-        "litigation",
-        "arbitrato",
-        "arbitration",
-        "settlement",
-        "out-of-court settlement",
-        "patteggiamento",
-        "plea deal",
-        "consent order",
-        "warning letter",
-        "richiamo ufficiale",
-        "regulatory warning",
-        "product recall",
-        "richiamo prodotto",
-        "revoca della licenza",
-        "license revoked",
-        "license revocation",
-        "license suspension",
-        "license suspended",
-        "authorization withdrawn",
-        "autorizzazione revocata",
-        "banned",
-        "blacklisted",
-        "debarred",
-        "watchlist",
-        "blacklist",
-        "default",
-        "loan default",
-        "insolvenza",
-        "insolvent",
-        "insolvency",
-        "fallimento",
-        "bankruptcy",
-        "chapter 11",
-        "chapter 7",
-        "liquidazione",
-        "liquidation",
-        "liquidazione giudiziale",
-        "procedura concorsuale",
-        "amministrazione controllata",
-        "receivership",
-        "restructuring",
-        "ristrutturazione del debito",
-        "cease and desist",
-        "injunction",
-        "court order",
-        "sequestro conservativo",
-        "pignoramento",
-        "foreclosure",
-        "regulatory warning",
-        "regulatory action",
-        "regulatory fine",
-        "consob",
-        "ivass",
-        "banca d'italia",
-        "banca ditalia",
-        "antitrust",
-        "authority fine",
-        "authority sanction",
-        "complaint",
-        "complaints",
-        "reclamo",
-        "reclami",
-        "customer complaint",
-        "esposto",
-        "denuncia",
-        "whistleblower",
-        "whistleblowing",
-    ]
-    if any(w in text for w in lvl1):
-        severity = max(severity, 1)
+        if first_idx != -1 and last_idx != -1:
+            # stima grezza della distanza in parole
+            words_before_first = text[:first_idx].count(" ")
+            words_before_last = text[:last_idx].count(" ")
+            word_distance = abs(words_before_last - words_before_first)
 
+            # se sono entro ~8 parole consideriamo rilevante
+            if word_distance <= 8:
+                return True
+
+    return False
+
+
+def _filter_by_name(query: str, items: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    Applica il filtro nome+cognome su titolo + snippet + URL.
+    """
+    filtered: List[Dict[str, str]] = []
+
+    for it in items:
+        blob = f"{it.get('title', '')} {it.get('snippet', '')} {it.get('url', '')}"
+        if _matches_name(query, blob):
+            filtered.append(it)
+
+    return filtered
+
+
+# ========= CALCOLO SEVERITÀ =========
+
+def _domain_from_url(url: str) -> str:
+    try:
+        without_proto = url.split("://", 1)[-1]
+        host = without_proto.split("/", 1)[0]
+        return host.lower()
+    except Exception:
+        return ""
+
+
+def _score_item(item: Dict[str, str]) -> int:
+    """
+    Ritorna la severity (0–3) e la scrive su item["severity"].
+    """
+    text = f"{item.get('title', '')} {item.get('snippet', '')}".lower()
+    url = item.get("url", "")
+    score = 0
+
+    # parole chiave negative
+    for kw in NEGATIVE_KEYWORDS:
+        if kw in text:
+            score += 1
+
+    # domini “pesanti”
+    domain = _domain_from_url(url)
+    for dom, weight in NEGATIVE_DOMAINS_WEIGHTS.items():
+        if dom in domain:
+            score += weight
+
+    if score >= 6:
+        severity = 3
+    elif score >= 3:
+        severity = 2
+    elif score >= 1:
+        severity = 1
+    else:
+        severity = 0
+
+    item["severity"] = severity
     return severity
 
 
+# ========= FUNZIONE PRINCIPALE USATA DA FASTAPI =========
+
 def analyze_reputation(query: str, max_results: int = 100) -> Dict[str, Any]:
     """
-    Motore reputazionale base (consumer):
-    - usa SOLO la query base (nome / azienda) su Google Programmable Search
-    - prende fino a 100 risultati
-    - analizza titolo+snippet con una lista di parole negative ita/eng
-    - calcola score 0-100 e livello LOW / MEDIUM / HIGH
+    Funzione chiamata da /analyze.
+
+    1) chiama Google CSE
+    2) filtra i risultati per nome+cognome
+    3) calcola severity e score
+    4) ritorna il JSON consumato dalla tua app Flutter.
     """
-    max_results = 100
+    # 1) ricerca base
+    raw_results = _google_search(query, max_results=max_results)
 
-    data = search_web(query, max_results=max_results)
-    raw_results = data.get("results", [])
+    # 2) filtro nome+cognome
+    filtered_results = _filter_by_name(query, raw_results)
 
-    analyzed: List[Dict[str, Any]] = []
-    score = 0
+    total_results = len(filtered_results)
 
-    name_tokens = [t for t in query.lower().split() if len(t) > 2]
-
-    for item in raw_results:
-        title = item.get("title", "") or ""
-        snippet = item.get("snippet", "") or ""
-        url = item.get("url", "") or ""
-        text = (title + " " + snippet).lower()
-
-        if name_tokens and not any(t in text for t in name_tokens):
-            severity = 0
-        else:
-            severity = _severity_for_text(text)
-
-        if severity == 3:
-            score += 12
-        elif severity == 2:
-            score += 7
-        elif severity == 1:
-            score += 3
-
-        analyzed.append(
-            {
-                "title": title,
-                "url": url,
-                "snippet": snippet,
-                "severity": severity,
-            }
-        )
-
-    if score > 100:
-        score = 100
-    if score < 0:
-        score = 0
-
-    if score >= 70:
-        level = "HIGH"
-    elif score >= 30:
-        level = "MEDIUM"
-    else:
-        level = "LOW"
-
-    return {
-        "query": query,
-        "score": score,
-        "level": level,
-        "total_results": len(analyzed),
-        "results": analyzed,
-    }
-
-
-def analyze_reputation_pro(query: str, max_total: int = 150) -> Dict[str, Any]:
-    """
-    Modalita PRO:
-    - esegue piu query mirate (pro_multi_search)
-    - deduplica per URL
-    - usa il dizionario 'panda' per severity
-    - calcola score 0-100
-    - conteggia quanti link negativi per livello
-    - restituisce solo un sottoinsieme strutturato pronto per PDF/report.
-    """
-    max_total = max_total or 150
-
-    raw_results = pro_multi_search(query, max_total=max_total)
-
-    analyzed: List[Dict[str, Any]] = []
-    score = 0
-
-    by_severity = {"3": 0, "2": 0, "1": 0}
+    # 3) calcolo negativi
     negative_count = 0
+    severity_sum = 0
 
-    for item in raw_results:
-        title = item.get("title", "") or ""
-        snippet = item.get("snippet", "") or ""
-        url = item.get("url", "") or ""
-        source_query = item.get("source_query", "") or ""
-        text = (title + " " + snippet).lower()
-
-        severity = _severity_for_text(text)
-
+    for item in filtered_results:
+        severity = _score_item(item)
         if severity > 0:
             negative_count += 1
-            by_severity[str(severity)] += 1
+            severity_sum += severity
 
-        if severity == 3:
-            score += 12
-        elif severity == 2:
-            score += 7
-        elif severity == 1:
-            score += 3
-
-        analyzed.append(
-            {
-                "title": title,
-                "url": url,
-                "snippet": snippet,
-                "severity": severity,
-                "source_query": source_query,
-            }
-        )
-
-    if score > 100:
-        score = 100
-    if score < 0:
-        score = 0
-
-    if score >= 70:
-        level = "HIGH"
-    elif score >= 30:
-        level = "MEDIUM"
-    else:
+    # 4) score e livello complessivo
+    if negative_count == 0:
         level = "LOW"
+        score = 0
+    else:
+        # base: numero di link * 3 + severità pesata * 5, clampato a 100
+        raw_score = negative_count * 3 + severity_sum * 5
+        score = min(100, raw_score)
+
+        if score >= 70:
+            level = "HIGH"
+        elif score >= 35:
+            level = "MEDIUM"
+        else:
+            level = "LOW"
 
     return {
         "query": query,
-        "mode": "pro",
         "score": score,
         "level": level,
-        "total_results": len(analyzed),
-        "negative_links_count": negative_count,
-        "by_severity": by_severity,
-        "results": analyzed,
+        "total_results": total_results,
+        "negative_results": negative_count,
+        "results": filtered_results,
     }
