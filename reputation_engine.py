@@ -1,7 +1,9 @@
 from typing import List, Dict, Any
+import re
 import requests
 
 from config import GOOGLE_API_KEY, GOOGLE_SEARCH_ENGINE_ID
+
 
 # ========= PAROLE E DOMINI NEGATIVI =========
 
@@ -29,7 +31,7 @@ NEGATIVE_DOMAINS_WEIGHTS: Dict[str, int] = {
     "finma.ch": 3,
     "bafin.de": 3,
 
-    # Altra stampa autorevole (peso medio)
+    # Stampa autorevole (peso medio)
     "reuters.com": 2,
     "bloomberg.com": 2,
     "ft.com": 2,
@@ -43,8 +45,8 @@ NEGATIVE_DOMAINS_WEIGHTS: Dict[str, int] = {
 
 def _google_search(query: str, max_results: int = 100) -> List[Dict[str, str]]:
     """
-    Esegue la ricerca su Google Programmable Search Engine
-    e restituisce una lista di dict {title, snippet, url}.
+    Ricerca su Google Programmable Search Engine.
+    Ritorna una lista di dict {title, snippet, url}.
     """
     results: List[Dict[str, str]] = []
     start = 1
@@ -87,19 +89,15 @@ def _google_search(query: str, max_results: int = 100) -> List[Dict[str, str]]:
 
         start += len(items)
 
-        # limite di Google: oltre 100 risulta inutile
         if start > 100:
             break
 
     return results
 
 
-# ========= FILTRO NOME + COGNOME =========
+# ========= FILTRO NOME + COGNOME (con word boundary) =========
 
 def _normalize_name(query: str):
-    """
-    Ritorna (first, last, full) in minuscolo.
-    """
     tokens = [t.strip().lower() for t in query.split() if t.strip()]
     if len(tokens) >= 2:
         first = tokens[0]
@@ -112,35 +110,49 @@ def _normalize_name(query: str):
         return "", "", ""
 
 
+def _contains_word(text: str, word: str) -> bool:
+    """
+    Match su parola intera: 'oretta' NON matcha 'loretta'.
+    """
+    if not word:
+        return False
+    pattern = r"\b" + re.escape(word) + r"\b"
+    return re.search(pattern, text) is not None
+
+
+def _word_index(text: str, word: str) -> int:
+    pattern = r"\b" + re.escape(word) + r"\b"
+    m = re.search(pattern, text)
+    return m.start() if m else -1
+
+
 def _matches_name(query: str, text: str) -> bool:
     """
     Tiene il risultato SOLO se:
     - contiene il nome completo "nome cognome", oppure
-    - contiene sia nome che cognome entro una distanza ragionevole.
+    - contiene sia nome che cognome entro distanza ragionevole.
     """
     first, last, full = _normalize_name(query)
     if not full:
-        # query vuota / strana -> tieni tutto
-        return True
+        return True  # query vuota/strana → non filtriamo
 
     text = text.lower()
 
     # match diretto "nome cognome"
-    if full in text:
+    if _contains_word(text, full):
         return True
 
-    # match "first" + "last" sparsi ma vicini
-    if first and last and (first in text and last in text):
-        first_idx = text.find(first)
-        last_idx = text.find(last)
+    # match "first" + "last" come parole intere
+    if first and last and _contains_word(text, first) and _contains_word(text, last):
+        idx_first = _word_index(text, first)
+        idx_last = _word_index(text, last)
 
-        if first_idx != -1 and last_idx != -1:
-            # stima grezza della distanza in parole
-            words_before_first = text[:first_idx].count(" ")
-            words_before_last = text[:last_idx].count(" ")
+        if idx_first != -1 and idx_last != -1:
+            words_before_first = text[:idx_first].count(" ")
+            words_before_last = text[:idx_last].count(" ")
             word_distance = abs(words_before_last - words_before_first)
 
-            # se sono entro ~8 parole consideriamo rilevante
+            # entro 8 parole → consideriamo rilevante
             if word_distance <= 8:
                 return True
 
@@ -148,9 +160,6 @@ def _matches_name(query: str, text: str) -> bool:
 
 
 def _filter_by_name(query: str, items: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """
-    Applica il filtro nome+cognome su titolo + snippet + URL.
-    """
     filtered: List[Dict[str, str]] = []
 
     for it in items:
@@ -174,18 +183,16 @@ def _domain_from_url(url: str) -> str:
 
 def _score_item(item: Dict[str, str]) -> int:
     """
-    Ritorna la severity (0–3) e la scrive su item["severity"].
+    Ritorna la severity (0–3) e la scrive in item["severity"].
     """
     text = f"{item.get('title', '')} {item.get('snippet', '')}".lower()
     url = item.get("url", "")
     score = 0
 
-    # parole chiave negative
     for kw in NEGATIVE_KEYWORDS:
         if kw in text:
             score += 1
 
-    # domini “pesanti”
     domain = _domain_from_url(url)
     for dom, weight in NEGATIVE_DOMAINS_WEIGHTS.items():
         if dom in domain:
@@ -204,41 +211,29 @@ def _score_item(item: Dict[str, str]) -> int:
     return severity
 
 
-# ========= FUNZIONE PRINCIPALE USATA DA FASTAPI =========
+# ========= FUNZIONE PRINCIPALE =========
 
 def analyze_reputation(query: str, max_results: int = 100) -> Dict[str, Any]:
     """
-    Funzione chiamata da /analyze.
-
-    1) chiama Google CSE
-    2) filtra i risultati per nome+cognome
-    3) calcola severity e score
-    4) ritorna il JSON consumato dalla tua app Flutter.
+    Funzione usata da /analyze e /analyze-pro.
     """
-    # 1) ricerca base
     raw_results = _google_search(query, max_results=max_results)
-
-    # 2) filtro nome+cognome
     filtered_results = _filter_by_name(query, raw_results)
 
     total_results = len(filtered_results)
 
-    # 3) calcolo negativi
     negative_count = 0
     severity_sum = 0
-
     for item in filtered_results:
-        severity = _score_item(item)
-        if severity > 0:
+        sev = _score_item(item)
+        if sev > 0:
             negative_count += 1
-            severity_sum += severity
+            severity_sum += sev
 
-    # 4) score e livello complessivo
     if negative_count == 0:
         level = "LOW"
         score = 0
     else:
-        # base: numero di link * 3 + severità pesata * 5, clampato a 100
         raw_score = negative_count * 3 + severity_sum * 5
         score = min(100, raw_score)
 
