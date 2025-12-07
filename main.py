@@ -3,14 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from config import log_google_config
-from reputation_engine import analyze_basic, analyze_pro, SearchEngineError
+from reputation_engine import analyze_basic, SearchEngineError
 
 
 class AnalyzeRequest(BaseModel):
-    query: str
-
-
-class AnalyzeProRequest(BaseModel):
     query: str
 
 
@@ -56,25 +52,6 @@ async def root():
 async def analyze_endpoint(payload: AnalyzeRequest):
     try:
         result = await analyze_basic(payload.query)
-        return result
-    except SearchEngineError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ✅ Alias per compatibilità con la webapp: /analyze2 fa la stessa cosa di /analyze
-@app.post("/analyze2")
-async def analyze2_endpoint(payload: AnalyzeRequest):
-    try:
-        result = await analyze_basic(payload.query)
-        return result
-    except SearchEngineError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/analyze-pro")
-async def analyze_pro_endpoint(payload: AnalyzeProRequest):
-    try:
-        result = await analyze_pro(payload.query)
         return result
     except SearchEngineError as e:
         raise HTTPException(status_code=500, detail=str(e))
