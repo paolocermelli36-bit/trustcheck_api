@@ -1,0 +1,11 @@
+BACKEND IN USO (UNICO)
+Percorso: C:\Users\paolo\Desktop\TrustCheck_BACKEND
+
+Comando per avviare in locale:
+1) cd C:\Users\paolo\Desktop\TrustCheck_BACKEND
+2) attiva venv (se presente)
+3) uvicorn main:app --reload --port 8000
+
+Endpoints esposti:
+- /analyze
+- /analyze-pro

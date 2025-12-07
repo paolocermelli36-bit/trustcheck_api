@@ -1,47 +1,71 @@
-from typing import Any, Dict
-from fastapi import FastAPI
+from __future__ import annotations
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from reputation_engine import analyze_reputation
-
-
-class AnalyzeRequest(BaseModel):
-    query: str
-
+from config import settings
+from reputation_engine import analyze_basic, analyze_pro
+from search_engine import SearchEngineError
 
 app = FastAPI(
     title="TrustCheck API",
-    version="1.0.0",
+    version="0.1.0",
 )
 
-
+# CORS per Flutter (web + app)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # per ora tutto aperto
+    allow_origins=["*"],  # in futuro puoi restringere
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@app.get("/")
-def root() -> Dict[str, Any]:
-    return {"status": "ok", "service": "trustcheck_api"}
+class AnalyzeRequest(BaseModel):
+    query: str
 
+
+class AnalyzeProRequest(BaseModel):
+    query: str
+
+
+@app.on_event("startup")
+def startup_event():
+    if not settings.google_api_key or not settings.google_cx_id:
+        print("⚠️  Attenzione: GOOGLE_API_KEY o GOOGLE_CX_ID non sono impostate nel file .env.")
+    else:
+        print("✅ Google Custom Search configurato correttamente.")
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "TrustCheck API — DeepScan engine"}
+
+
+# =========================
+#   ENDPOINTS PRINCIPALI
+# =========================
 
 @app.post("/analyze")
-def analyze(req: AnalyzeRequest) -> Dict[str, Any]:
+def analyze(request: AnalyzeRequest):
     """
-    Endpoint principale: usa il motore unico.
+    Endpoint principale usato dalla APP.
+    Ora punta direttamente alla MODALITÀ PRO (FASE 5 SAFE).
     """
-    return analyze_reputation(req.query)
+    try:
+        return analyze_pro(request.query)
+    except SearchEngineError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/analyze-pro")
-def analyze_pro(req: AnalyzeRequest) -> Dict[str, Any]:
+def analyze_pro_endpoint(request: AnalyzeProRequest):
     """
-    Per ora PRO usa lo stesso motore di /analyze,
-    così l'app non va in 404.
+    Alias esplicito PRO (stesso motore di /analyze).
     """
-    return analyze_reputation(req.query)
+    try:
+        return analyze_pro(request.query)
+    except SearchEngineError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))

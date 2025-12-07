@@ -1,66 +1,83 @@
-from typing import List, Dict, Any
-import requests
+from __future__ import annotations
 
-from config import GOOGLE_API_KEY, GOOGLE_SEARCH_ENGINE_ID
+import time
+from typing import List, Dict
 
+import httpx
 
-def _normalize_item(item: Dict[str, Any]) -> Dict[str, str]:
-    """Normalizza un singolo risultato CSE in formato pulito."""
-    return {
-        "title": item.get("title", "") or "",
-        "snippet": item.get("snippet", "") or "",
-        "url": item.get("link", "") or ""
-    }
+from config import settings
 
 
-def search_web(query: str, max_results: int = 100) -> Dict[str, Any]:
-    """
-    Ricerca completa con Google Programmable Search Engine (CSE).
-    Recupera fino a max_results risultati reali.
-    """
-    results: List[Dict[str, str]] = []
+class SearchEngineError(Exception):
+    """Errore generico del motore di ricerca."""
+    pass
 
-    start = 1  # Google parte da 1
-    per_page = 10  # Google CSE restituisce max 10 risultati alla volta
 
-    while len(results) < max_results:
-        num = min(per_page, max_results - len(results))
-
-        params = {
-            "key": GOOGLE_API_KEY,
-            "cx": GOOGLE_SEARCH_ENGINE_ID,
-            "q": query,
-            "start": start,
-            "num": num,
-        }
-
-        resp = requests.get(
-            "https://www.googleapis.com/customsearch/v1",
-            params=params,
-            timeout=10
+def _ensure_config_ok() -> None:
+    if not settings.google_api_key or not settings.google_cx_id:
+        raise SearchEngineError(
+            "GOOGLE_API_KEY o GOOGLE_CX_ID non configurati sul server."
         )
 
-        if resp.status_code != 200:
-            return {
-                "query": query,
-                "error": f"Google error {resp.status_code}: {resp.text}",
-                "results": []
-            }
 
-        data = resp.json()
-        items = data.get("items", [])
+def _google_single_query(query: str, start: int, num: int) -> List[Dict]:
+    """
+    Esegue UNA chiamata a Google Custom Search per una singola query.
+    """
+    _ensure_config_ok()
 
-        if not items:
-            break
-
-        for item in items:
-            results.append(_normalize_item(item))
-
-        # passa al successivo blocco di 10
-        start += 10
-
-    return {
-        "query": query,
-        "total_results": len(results),
-        "results": results
+    params = {
+        "key": settings.google_api_key,
+        "cx": settings.google_cx_id,
+        "q": query,
+        "start": start,
+        "num": num,
     }
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get("https://www.googleapis.com/customsearch/v1", params=params)
+    except httpx.RequestError as exc:
+        raise SearchEngineError(f"Errore di rete verso Google: {exc}") from exc
+
+    if resp.status_code != 200:
+        raise SearchEngineError(
+            f"Google API ha risposto con status {resp.status_code}: {resp.text}"
+        )
+
+    data = resp.json()
+    return data.get("items", []) or []
+
+
+def google_custom_search(queries: List[str], total_limit: int) -> List[Dict]:
+    """
+    FASE 5 SAFE:
+    - accetta una lista di query (multi-lingua, negative, ecc.)
+    - distribuisce il budget totale tra le query
+    - unisce e restituisce TUTTI i risultati (senza dedup: ci pensa il motore reputazionale)
+    """
+    if not queries:
+        return []
+
+    # Budget massimo totale
+    total_limit = max(1, min(total_limit, settings.max_results_pro_safe))
+
+    # Risultati per query, limitati dal per_query_limit_safe
+    per_query = max(1, min(settings.per_query_limit_safe, total_limit // len(queries)))
+    if per_query < 1:
+        per_query = 1
+
+    all_items: List[Dict] = []
+
+    for q in queries:
+        # Sempre partire da 1 (prima pagina)
+        try:
+            items = _google_single_query(q, start=1, num=per_query)
+            all_items.extend(items)
+        except SearchEngineError as exc:
+            # Se una query fallisce, continuiamo con le altre
+            print(f"[google_custom_search] Query fallita '{q}': {exc}")
+        # Throttle minimo per sicurezza (rate-limit friendly)
+        time.sleep(0.2)
+
+    return all_items

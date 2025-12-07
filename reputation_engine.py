@@ -1,248 +1,241 @@
-from typing import List, Dict, Any
-import re
-import requests
+from __future__ import annotations
 
-from config import GOOGLE_API_KEY, GOOGLE_SEARCH_ENGINE_ID
+from typing import Dict, List, Tuple
 
-
-# ========= PAROLE E DOMINI NEGATIVI =========
-
-NEGATIVE_KEYWORDS = [
-    "scam", "fraud", "ponzi", "scheme", "arrest", "indicted", "charged",
-    "money laundering", "laundering", "fine", "sanction", "lawsuit",
-    "complaint", "investigation", "bribery", "corruption", "crime",
-    "criminal", "regulator", "class action", "bankruptcy", "liquidation",
-    "suspension", "revocation", "ban", "banned", "warning", "blacklist",
-    "watchlist", "default", "debt collection", "foreclosure",
-]
-
-NEGATIVE_DOMAINS_WEIGHTS: Dict[str, int] = {
-    # Autorità e regolatori (peso alto)
-    "sec.gov": 3,
-    "justice.gov": 3,
-    "ftc.gov": 3,
-    "consob.it": 3,
-    "agcm.it": 3,
-    "ivass.it": 3,
-    "bancaditalia.it": 3,
-    "banque-france.fr": 3,
-    "amf-france.org": 3,
-    "fca.org.uk": 3,
-    "finma.ch": 3,
-    "bafin.de": 3,
-
-    # Stampa autorevole (peso medio)
-    "reuters.com": 2,
-    "bloomberg.com": 2,
-    "ft.com": 2,
-    "wsj.com": 2,
-    "nytimes.com": 2,
-    "theguardian.com": 2,
-}
+from config import settings
+from search_engine import google_custom_search, SearchEngineError
 
 
-# ========= RICERCA SU GOOGLE CSE =========
+def _clean_query(raw: str) -> str:
+    q = (raw or "").strip()
+    # Togliamo doppi spazi e virgolette strane
+    q = q.replace("\n", " ").replace("\r", " ")
+    while "  " in q:
+        q = q.replace("  ", " ")
+    q = q.replace('"', " ")
+    return q
 
-def _google_search(query: str, max_results: int = 100) -> List[Dict[str, str]]:
+
+# =========================
+#   COSTRUZIONE DELLE QUERY
+# =========================
+
+def build_queries_base(raw_query: str) -> List[str]:
     """
-    Ricerca su Google Programmable Search Engine.
-    Ritorna una lista di dict {title, snippet, url}.
+    Filtro 1–2: pulizia nome/brand + query base.
     """
-    results: List[Dict[str, str]] = []
-    start = 1
-    per_page = 10
+    cleaned = _clean_query(raw_query)
+    if not cleaned:
+        raise ValueError("Query vuota.")
 
-    while len(results) < max_results:
-        num = min(per_page, max_results - len(results))
-
-        params = {
-            "key": GOOGLE_API_KEY,
-            "cx": GOOGLE_SEARCH_ENGINE_ID,
-            "q": query,
-            "start": start,
-            "num": num,
-        }
-
-        resp = requests.get(
-            "https://www.googleapis.com/customsearch/v1",
-            params=params,
-            timeout=10,
-        )
-
-        if resp.status_code != 200:
-            break
-
-        data = resp.json()
-        items = data.get("items", [])
-
-        for item in items:
-            results.append(
-                {
-                    "title": item.get("title", "") or "",
-                    "snippet": item.get("snippet", "") or "",
-                    "url": item.get("link", "") or "",
-                }
-            )
-
-        if not items:
-            break
-
-        start += len(items)
-
-        if start > 100:
-            break
-
-    return results
+    base = f'"{cleaned}"'
+    return [base]
 
 
-# ========= NORMALIZZAZIONE NOME =========
-
-def _normalize_name(query: str):
-    tokens = [t.strip().lower() for t in query.split() if t.strip()]
-    if len(tokens) >= 2:
-        first = tokens[0]
-        last = tokens[-1]
-        full = f"{first} {last}"
-        return first, last, full
-    elif len(tokens) == 1:
-        return tokens[0], "", tokens[0]
-    else:
-        return "", "", ""
-
-
-def _clean_for_match(text: str) -> str:
+def build_queries_pro(raw_query: str) -> List[str]:
     """
-    Porta a lower case e sostituisce - e _ con spazio (per le URL).
+    FASE 5 SAFE — multi-lingua + query estese.
+
+    Strategia:
+    - Query base (neutra) = DeepScan "panoramica"
+    - Query IT con negative
+    - Query EN con negative
+    - Query ES con negative
+
+    Totale massimo: 4 query (SAFE).
     """
-    text = text.lower()
-    text = text.replace("-", " ").replace("_", " ")
-    return text
+    cleaned = _clean_query(raw_query)
+    if not cleaned:
+        raise ValueError("Query vuota.")
+
+    base = f'"{cleaned}"'
+
+    neg_it = " OR ".join(settings.negative_keywords_it)
+    neg_en = " OR ".join(settings.negative_keywords_en)
+    neg_es = " OR ".join(settings.negative_keywords_es)
+
+    q_base = base
+    q_it = f'{base} ({neg_it})'
+    q_en = f'{base} ({neg_en})'
+    q_es = f'{base} ({neg_es})'
+
+    return [q_base, q_it, q_en, q_es]
 
 
-def _matches_name(query: str, title: str, snippet: str, url: str) -> bool:
-    """
-    FILTRO SUPER STRETTO:
-    - per query con nome + cognome, accettiamo SOLO se
-      il pattern appare esattamente (contiguo) nel testo o nell'URL.
-    """
-    first, last, full = _normalize_name(query)
+# =========================
+#   RANKING & CLASSIFICA
+# =========================
 
-    # Query strana/vuota → non filtriamo
-    if not full:
-        return True
+def _is_recent(text: str) -> bool:
+    t = text.lower()
+    return any(year in t for year in settings.recent_years)
 
-    # Costruiamo le varianti accettate
-    patterns = [
-        full,                      # "oretta croce"
-        f"{last} {first}",         # "croce oretta"
-        f"{last}, {first}",        # "croce, oretta"
-    ]
 
-    text_blob = _clean_for_match(f"{title} {snippet}")
-    url_blob = _clean_for_match(url)
-
-    for p in patterns:
-        if p in text_blob or p in url_blob:
+def _has_negative_kw(text: str) -> bool:
+    t = text.lower()
+    for kw in (
+        *settings.negative_keywords_it,
+        *settings.negative_keywords_en,
+        *settings.negative_keywords_es,
+    ):
+        if kw.lower() in t:
             return True
-
-    # Se non troviamo la sequenza esatta, SCARTIAMO
     return False
 
 
-def _filter_by_name(query: str, items: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    filtered: List[Dict[str, str]] = []
-
-    for it in items:
-        title = it.get("title", "")
-        snippet = it.get("snippet", "")
-        url = it.get("url", "")
-        if _matches_name(query, title, snippet, url):
-            filtered.append(it)
-
-    return filtered
-
-
-# ========= CALCOLO SEVERITÀ =========
-
-def _domain_from_url(url: str) -> str:
-    try:
-        without_proto = url.split("://", 1)[-1]
-        host = without_proto.split("/", 1)[0]
-        return host.lower()
-    except Exception:
-        return ""
+def _domain_score(url: str) -> int:
+    url_l = url.lower()
+    for dom in settings.high_auth_domains:
+        if dom in url_l:
+            return 2  # autorità/media forte
+    if ".gov" in url_l or ".gouv" in url_l:
+        return 2
+    if ".int" in url_l or ".eu" in url_l:
+        return 1
+    return 0
 
 
-def _score_item(item: Dict[str, str]) -> int:
+def _classify_item(item: Dict) -> Tuple[str, int]:
     """
-    Ritorna la severity (0–3) e la scrive in item["severity"].
+    Restituisce (severity, score numerico 0-4).
     """
-    text = f"{item.get('title', '')} {item.get('snippet', '')}".lower()
-    url = item.get("url", "")
+    url = item.get("link", "") or ""
+    title = item.get("title", "") or ""
+    snippet = item.get("snippet", "") or ""
+
+    text = f"{title} {snippet}"
+
     score = 0
 
-    for kw in NEGATIVE_KEYWORDS:
-        if kw in text:
-            score += 1
+    if _has_negative_kw(text):
+        score += 1
 
-    domain = _domain_from_url(url)
-    for dom, weight in NEGATIVE_DOMAINS_WEIGHTS.items():
-        if dom in domain:
-            score += weight
+    if _is_recent(text):
+        score += 1
 
-    if score >= 6:
-        severity = 3
-    elif score >= 3:
-        severity = 2
-    elif score >= 1:
-        severity = 1
-    else:
-        severity = 0
+    score += _domain_score(url)
 
-    item["severity"] = severity
-    return severity
+    # Mappa score -> severity
+    if score >= 4:
+        return "critical", score
+    if score == 3:
+        return "high", score
+    if score == 2:
+        return "medium", score
+    return "low", score
 
 
-# ========= FUNZIONE PRINCIPALE =========
-
-def analyze_reputation(query: str, max_results: int = 100) -> Dict[str, Any]:
+def _deduplicate(items: List[Dict]) -> List[Dict]:
     """
-    Funzione usata da /analyze e /analyze-pro.
+    Deduplica i risultati per URL.
     """
-    raw_results = _google_search(query, max_results=max_results)
-    filtered_results = _filter_by_name(query, raw_results)
+    seen = set()
+    deduped = []
+    for it in items:
+        url = it.get("link")
+        if not url:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        deduped.append(it)
+    return deduped
 
-    total_results = len(filtered_results)
 
-    negative_count = 0
-    severity_sum = 0
-    for item in filtered_results:
-        sev = _score_item(item)
-        if sev > 0:
-            negative_count += 1
-            severity_sum += sev
+def _aggregate(items: List[Dict]) -> Dict:
+    """
+    Calcola contatori, score e livello finale.
+    """
+    total = len(items)
+    if total == 0:
+        return {
+            "total_results": 0,
+            "negative_results": 0,
+            "score": 0,
+            "level": "LOW",
+            "critical": 0,
+            "high": 0,
+            "medium": 0,
+            "low": 0,
+            "results": [],
+        }
 
-    if negative_count == 0:
-        level = "LOW"
-        score = 0
-    else:
-        raw_score = negative_count * 3 + severity_sum * 5
-        score = min(100, raw_score)
+    critical = high = medium = low = 0
+    negative_results = 0
+    total_risk_score = 0
 
-        if score >= 70:
-            level = "HIGH"
-        elif score >= 35:
-            level = "MEDIUM"
-            # sotto 35 → LOW
+    enriched_results = []
 
+    for it in items:
+        severity, s = _classify_item(it)
+        it_with_sev = dict(it)
+        it_with_sev["severity"] = severity
+        it_with_sev["risk_score"] = s
+        enriched_results.append(it_with_sev)
+
+        total_risk_score += s
+
+        if severity == "critical":
+            critical += 1
+            negative_results += 1
+        elif severity == "high":
+            high += 1
+            negative_results += 1
+        elif severity == "medium":
+            medium += 1
+            negative_results += 1
         else:
-            level = "LOW"
+            low += 1
+
+    # Score 0–100, normalizzato
+    max_possible = total * 4
+    if max_possible == 0:
+        final_score = 0
+    else:
+        final_score = int((total_risk_score / max_possible) * 100)
+
+    if final_score >= 70:
+        level = "HIGH"
+    elif final_score >= 40:
+        level = "MEDIUM"
+    else:
+        level = "LOW"
 
     return {
-        "query": query,
-        "score": score,
+        "total_results": total,
+        "negative_results": negative_results,
+        "score": final_score,
         "level": level,
-        "total_results": total_results,
-        "negative_results": negative_count,
-        "results": filtered_results,
+        "critical": critical,
+        "high": high,
+        "medium": medium,
+        "low": low,
+        "results": enriched_results,
     }
+
+
+# =========================
+#   ENTRY POINT PUBBLICI
+# =========================
+
+def analyze_basic(query: str) -> Dict:
+    """
+    Modalità "base" (usiamo comunque DeepScan ma con meno risultati).
+    """
+    queries = build_queries_base(query)
+    raw_items = google_custom_search(queries, total_limit=settings.max_results_basic)
+    deduped = _deduplicate(raw_items)
+    return _aggregate(deduped)
+
+
+def analyze_pro(query: str) -> Dict:
+    """
+    Modalità PRO — FASE 5 SAFE:
+    - multi-query
+    - multi-lingua (IT/EN/ES)
+    - ranking negativo
+    """
+    queries = build_queries_pro(query)
+    raw_items = google_custom_search(queries, total_limit=settings.max_results_pro_safe)
+    deduped = _deduplicate(raw_items)
+    return _aggregate(deduped)
