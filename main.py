@@ -19,15 +19,14 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Domini autorizzati a chiamare l'API (CORS)
+# Domini autorizzati (CORS)
 origins = [
-    # locale (per test futuri)
+    # locale
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     # dominio principale
     "https://trustcheckscan.com",
     "https://www.trustcheckscan.com",
-    # sottodominio app (quello che stai usando)
     "https://app.trustcheckscan.com",
     # netlify diretto
     "https://stately-creponne-626be4.netlify.app",
@@ -44,7 +43,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
-    # log di servizio per verificare che le chiavi Google siano lette correttamente
+    # Log di servizio per verificare le chiavi Google
     log_google_config()
 
 
@@ -55,6 +54,16 @@ async def root():
 
 @app.post("/analyze")
 async def analyze_endpoint(payload: AnalyzeRequest):
+    try:
+        result = await analyze_basic(payload.query)
+        return result
+    except SearchEngineError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ✅ Alias per compatibilità con la webapp: /analyze2 fa la stessa cosa di /analyze
+@app.post("/analyze2")
+async def analyze2_endpoint(payload: AnalyzeRequest):
     try:
         result = await analyze_basic(payload.query)
         return result
