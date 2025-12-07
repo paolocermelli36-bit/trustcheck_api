@@ -1,241 +1,143 @@
-from __future__ import annotations
+from typing import List, Dict, Any, Tuple
+import re
 
-from typing import Dict, List, Tuple
-
-from config import settings
 from search_engine import google_custom_search, SearchEngineError
 
 
-def _clean_query(raw: str) -> str:
-    q = (raw or "").strip()
-    # Togliamo doppi spazi e virgolette strane
-    q = q.replace("\n", " ").replace("\r", " ")
-    while "  " in q:
-        q = q.replace("  ", " ")
-    q = q.replace('"', " ")
-    return q
+# Parole chiave molto rozze per capire se un risultato è negativo
+NEGATIVE_KEYWORDS = [
+    "scandal", "fraud", "lawsuit", "fine", "penalty", "indicted", "charged",
+    "guilty", "money laundering", "investigation", "probe", "sanction",
+    "misconduct", "complaint", "class action", "crime", "illegal", "controversy",
+    "ban", "warning", "cease and desist", "settlement",
+    "sanzione", "indagine", "procedimento", "condanna", "arresto",
+    "truffa", "frode", "riciclaggio", "revoca", "radiazione",
+]
 
 
-# =========================
-#   COSTRUZIONE DELLE QUERY
-# =========================
-
-def build_queries_base(raw_query: str) -> List[str]:
+def _is_negative(text: str) -> Tuple[bool, int]:
     """
-    Filtro 1–2: pulizia nome/brand + query base.
+    Ritorna (is_negative, severity) con severity 1=low,2=medium,3=high.
+    Logica spartana ma sufficiente per test.
     """
-    cleaned = _clean_query(raw_query)
-    if not cleaned:
-        raise ValueError("Query vuota.")
-
-    base = f'"{cleaned}"'
-    return [base]
-
-
-def build_queries_pro(raw_query: str) -> List[str]:
-    """
-    FASE 5 SAFE — multi-lingua + query estese.
-
-    Strategia:
-    - Query base (neutra) = DeepScan "panoramica"
-    - Query IT con negative
-    - Query EN con negative
-    - Query ES con negative
-
-    Totale massimo: 4 query (SAFE).
-    """
-    cleaned = _clean_query(raw_query)
-    if not cleaned:
-        raise ValueError("Query vuota.")
-
-    base = f'"{cleaned}"'
-
-    neg_it = " OR ".join(settings.negative_keywords_it)
-    neg_en = " OR ".join(settings.negative_keywords_en)
-    neg_es = " OR ".join(settings.negative_keywords_es)
-
-    q_base = base
-    q_it = f'{base} ({neg_it})'
-    q_en = f'{base} ({neg_en})'
-    q_es = f'{base} ({neg_es})'
-
-    return [q_base, q_it, q_en, q_es]
-
-
-# =========================
-#   RANKING & CLASSIFICA
-# =========================
-
-def _is_recent(text: str) -> bool:
     t = text.lower()
-    return any(year in t for year in settings.recent_years)
-
-
-def _has_negative_kw(text: str) -> bool:
-    t = text.lower()
-    for kw in (
-        *settings.negative_keywords_it,
-        *settings.negative_keywords_en,
-        *settings.negative_keywords_es,
-    ):
-        if kw.lower() in t:
-            return True
-    return False
-
-
-def _domain_score(url: str) -> int:
-    url_l = url.lower()
-    for dom in settings.high_auth_domains:
-        if dom in url_l:
-            return 2  # autorità/media forte
-    if ".gov" in url_l or ".gouv" in url_l:
-        return 2
-    if ".int" in url_l or ".eu" in url_l:
-        return 1
-    return 0
-
-
-def _classify_item(item: Dict) -> Tuple[str, int]:
-    """
-    Restituisce (severity, score numerico 0-4).
-    """
-    url = item.get("link", "") or ""
-    title = item.get("title", "") or ""
-    snippet = item.get("snippet", "") or ""
-
-    text = f"{title} {snippet}"
-
     score = 0
 
-    if _has_negative_kw(text):
-        score += 1
+    for kw in NEGATIVE_KEYWORDS:
+        if kw in t:
+            # parole più forti => +2
+            if any(w in kw for w in ["fraud", "truffa", "money laundering", "riciclaggio",
+                                     "indicted", "charged", "condanna", "arresto",
+                                     "class action", "crime", "illegal"]):
+                score += 2
+            else:
+                score += 1
 
-    if _is_recent(text):
-        score += 1
-
-    score += _domain_score(url)
-
-    # Mappa score -> severity
+    if score == 0:
+        return False, 0
     if score >= 4:
-        return "critical", score
-    if score == 3:
-        return "high", score
-    if score == 2:
-        return "medium", score
-    return "low", score
+        return True, 3
+    if score >= 2:
+        return True, 2
+    return True, 1
 
 
-def _deduplicate(items: List[Dict]) -> List[Dict]:
-    """
-    Deduplica i risultati per URL.
-    """
-    seen = set()
-    deduped = []
-    for it in items:
-        url = it.get("link")
-        if not url:
-            continue
-        if url in seen:
-            continue
-        seen.add(url)
-        deduped.append(it)
-    return deduped
-
-
-def _aggregate(items: List[Dict]) -> Dict:
-    """
-    Calcola contatori, score e livello finale.
-    """
+def _build_response(query: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
     total = len(items)
-    if total == 0:
-        return {
-            "total_results": 0,
-            "negative_results": 0,
-            "score": 0,
-            "level": "LOW",
-            "critical": 0,
-            "high": 0,
-            "medium": 0,
-            "low": 0,
-            "results": [],
-        }
+    negatives: List[Dict[str, Any]] = []
 
     critical = high = medium = low = 0
-    negative_results = 0
-    total_risk_score = 0
 
-    enriched_results = []
+    for item in items:
+        title = item.get("title", "")
+        snippet = item.get("snippet", "")
+        link = item.get("link", "")
 
-    for it in items:
-        severity, s = _classify_item(it)
-        it_with_sev = dict(it)
-        it_with_sev["severity"] = severity
-        it_with_sev["risk_score"] = s
-        enriched_results.append(it_with_sev)
+        is_neg, sev = _is_negative(f"{title} {snippet}")
+        if not is_neg:
+            continue
 
-        total_risk_score += s
-
-        if severity == "critical":
-            critical += 1
-            negative_results += 1
-        elif severity == "high":
-            high += 1
-            negative_results += 1
-        elif severity == "medium":
+        if sev == 3:
+            high += 1  # usiamo solo high/medium/low, critical=0 in questa versione
+        elif sev == 2:
             medium += 1
-            negative_results += 1
         else:
             low += 1
 
-    # Score 0–100, normalizzato
-    max_possible = total * 4
-    if max_possible == 0:
-        final_score = 0
-    else:
-        final_score = int((total_risk_score / max_possible) * 100)
+        negatives.append(
+            {
+                "title": title,
+                "link": link,
+                "snippet": snippet,
+                "severity": sev,
+            }
+        )
 
-    if final_score >= 70:
+    negative_count = len(negatives)
+
+    # Calcolo score grezzo
+    score = min(100, negative_count * 5 + high * 10 + medium * 5)
+
+    if score >= 70:
         level = "HIGH"
-    elif final_score >= 40:
+    elif score >= 40:
         level = "MEDIUM"
+    elif score > 0:
+        level = "LOW"
     else:
         level = "LOW"
 
     return {
         "total_results": total,
-        "negative_results": negative_results,
-        "score": final_score,
+        "negative_results": negative_count,
+        "score": score,
         "level": level,
-        "critical": critical,
+        "critical": 0,
         "high": high,
         "medium": medium,
         "low": low,
-        "results": enriched_results,
+        "results": negatives,
     }
 
 
-# =========================
-#   ENTRY POINT PUBBLICI
-# =========================
-
-def analyze_basic(query: str) -> Dict:
+async def analyze_basic(query: str) -> Dict[str, Any]:
     """
-    Modalità "base" (usiamo comunque DeepScan ma con meno risultati).
+    Modalità standard: una query secca.
     """
-    queries = build_queries_base(query)
-    raw_items = google_custom_search(queries, total_limit=settings.max_results_basic)
-    deduped = _deduplicate(raw_items)
-    return _aggregate(deduped)
+    items = await google_custom_search(query, max_results=30)
+    return _build_response(query, items)
 
 
-def analyze_pro(query: str) -> Dict:
+async def analyze_pro(query: str) -> Dict[str, Any]:
     """
-    Modalità PRO — FASE 5 SAFE:
-    - multi-query
-    - multi-lingua (IT/EN/ES)
-    - ranking negativo
+    Modalità PRO: stessa logica ma con multi-query (nome + nome "scandal" ecc.).
     """
-    queries = build_queries_pro(query)
-    raw_items = google_custom_search(queries, total_limit=settings.max_results_pro_safe)
-    deduped = _deduplicate(raw_items)
-    return _aggregate(deduped)
+    # Query varianti base
+    variants = [
+        query,
+        f"{query} scandal",
+        f"{query} investigation",
+        f"{query} fraud",
+        f"{query} lawsuit",
+        f"{query} sanzione",
+        f"{query} indagine",
+    ]
+
+    all_items: List[Dict[str, Any]] = []
+    seen_links = set()
+
+    for q in variants:
+        try:
+            items = await google_custom_search(q, max_results=20)
+        except SearchEngineError:
+            # Se qualcosa va storto, ci fermiamo e ritorniamo quello che abbiamo
+            break
+
+        for it in items:
+            link = it.get("link")
+            if not link or link in seen_links:
+                continue
+            seen_links.add(link)
+            all_items.append(it)
+
+    return _build_response(query, all_items)
