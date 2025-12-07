@@ -5,12 +5,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GOOGLE_CX_ID = os.getenv("GOOGLE_CX_ID")
+GOOGLE_CX = os.getenv("GOOGLE_CX") or os.getenv("GOOGLE_CX_ID")
 
 
 def log_google_config() -> None:
     """Solo log di servizio, niente panico se manca."""
-    if GOOGLE_API_KEY and GOOGLE_CX_ID:
-        print("Google Custom Search configurato correttamente.")
-    else:
-        print("Google Custom Search NON configurato (manca GOOGLE_API_KEY o GOOGLE_CX_ID).")
+    if GOOGLE_API_KEY and GOOGLE_CX:
+    print("Google Custom Search configurato correttamente.")
+else:
+    print("Google Custom Search NON configurato (manca GOOGLE_API_KEY o GOOGLE_CX).")
