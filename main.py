@@ -15,23 +15,11 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Domini autorizzati (CORS)
-origins = [
-    # locale
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    # dominio principale
-    "https://trustcheckscan.com",
-    "https://www.trustcheckscan.com",
-    "https://app.trustcheckscan.com",
-    # netlify diretto
-    "https://stately-creponne-626be4.netlify.app",
-]
-
+# CORS aperto per TUTTI i domini
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -39,7 +27,6 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
-    # Log di servizio per verificare le chiavi Google
     log_google_config()
 
 
